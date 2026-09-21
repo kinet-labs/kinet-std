@@ -1,0 +1,186 @@
+[profile.default]
+src = "contracts"
+out = "out"
+libs = ["lib"]
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+solc_version = "0.8.31"
+auto_detect_solc = true
+evm_version = "cancun"
+remappings = [
+    # KNT Contracts paths
+    "@kinet/kinet-std/=contracts/",  # Primary package name
+    "@kinet/contracts/=contracts/",  # Alternate name
+    "@kinet/lamport/=../lamport/contracts/",
+    "@kinet/contracts/lib/=lib/openzeppelin-contracts/contracts/",
+    "@kinet/contracts/lib-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+    "@knt/=contracts/",  # Legacy alias
+    "manifoldxyz/=lib/manifoldxyz/",
+    "@manifoldxyz/=lib/manifoldxyz/",
+
+    # OpenZeppelin
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+
+    # Account Abstraction (ERC-4337)
+    "@account-abstraction/=lib/account-abstraction/contracts/",
+
+    # Safe (Gnosis) - v1.5.0
+    "@safe-global/safe-smart-account/=lib/safe-smart-account/contracts/",
+    "@safe-global/safe-modules/=lib/safe-modules/modules/",
+    "@gnosis.pm/safe-contracts/=lib/safe-smart-account/contracts/",
+    "safe-smart-account/=lib/safe-smart-account/contracts/",
+
+    # DeFi - Uniswap (V2: GPL-2.0, V3: GPL-2.0 converted from BUSL)
+    "@uniswap/v2-core/=lib/uni-v2/",
+    "@uniswap/v3-core/=lib/uni-v3/",
+    "@uniswap/v3-periphery/=lib/uni-v3-periphery/",
+    "@uniswap/lib/=lib/uni-lib/",
+    # Seaport NFT Marketplace (v1.6)
+    "@seaport/=lib/seaport/contracts/",
+    "seaport-core/=lib/seaport/lib/seaport-core/",
+    "seaport-types/=lib/seaport/lib/seaport-types/",
+    "seaport-sol/=lib/seaport/lib/seaport-sol/",
+
+    # Utilities
+    "@solmate/=lib/solmate/src/",
+    "solmate/=lib/solmate/src/",
+    "clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+    "@rari-capital/solmate/=lib/solmate/",
+
+    # PRB Math
+    "@prb/math/=lib/prb-math/src/",
+
+    # Chainlink
+    "@chainlink/contracts/=lib/chainlink/contracts/",
+
+    # Compound V3 (Comet)
+    "@compound-v3/=lib/compound-v3/contracts/",
+
+    # Pyth Network
+    "@pyth-network/=lib/pyth/",
+
+    # DeFi Protocols
+    "@curve/=lib/curve/contracts/",
+    "@balancer/=lib/balancer/pkg/",
+    "@lido/=lib/lido/contracts/",
+    "@pendle/=lib/pendle/contracts/",
+    "@kinet/markets/=contracts/markets/",
+
+    # Base64
+    "base64-sol/=lib/base64/",
+
+    # Hardhat console compatibility
+    "hardhat/=lib/forge-std/src/",
+
+    # Forge
+    "forge-std/=lib/forge-std/src/",
+]
+
+# Ignore warnings from problematic library files (natspec compatibility issues with solc 0.8.31)
+ignored_warnings_from = ["lib/safe-smart-account/**", "lib/**"]
+
+[profile.default.fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = true
+
+# Allow reading Seaport artifacts for deployment
+fs_permissions = [
+    { access = "read", path = "./out-seaport" },
+    { access = "read", path = "out-seaport" },
+    { access = "read", path = "/home/ling/work/src/github.com/kinet-labs/kinet-std/out-seaport" }
+]
+
+# Remappings
+remappings = [
+    "@kinet/kinet-std/=contracts/",
+    "@kinet/contracts/=contracts/",
+    "@kinet/lamport/=../lamport/contracts/",
+    "@kinet/contracts/lib/=lib/openzeppelin-contracts/contracts/",
+    "@kinet/contracts/lib-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+    "@knt/=contracts/",
+    "manifoldxyz/=lib/manifoldxyz/",
+    "@manifoldxyz/=lib/manifoldxyz/",
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+    "@account-abstraction/=lib/account-abstraction/contracts/",
+    "@safe-global/safe-smart-account/=lib/safe-smart-account/contracts/",
+    "@safe-global/safe-modules/=lib/safe-modules/modules/",
+    "@gnosis.pm/safe-contracts/=lib/safe-smart-account/contracts/",
+    "safe-smart-account/=lib/safe-smart-account/contracts/",
+    "@uniswap/v2-core/=lib/uni-v2/",
+    "@uniswap/v3-core/=lib/uni-v3/",
+    "@uniswap/v3-periphery/=lib/uni-v3-periphery/",
+    "@uniswap/lib/=lib/uni-lib/",
+    "@seaport/=lib/seaport/contracts/",
+    "seaport-core/=lib/seaport/lib/seaport-core/",
+    "seaport-types/=lib/seaport/lib/seaport-types/",
+    "seaport-sol/=lib/seaport/lib/seaport-sol/",
+    "@reservoir/=lib/core/packages/contracts/contracts/",
+    "@solmate/=lib/solmate/src/",
+    "solmate/=lib/solmate/src/",
+    "clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+    "@rari-capital/solmate/=lib/solmate/",
+    "@prb/math/=lib/prb-math/src/",
+    "@chainlink/contracts/=lib/chainlink/contracts/",
+    "@compound-v3/=lib/compound-v3/contracts/",
+    "@pyth-network/=lib/pyth/",
+    "@curve/=lib/curve/contracts/",
+    "@balancer/=lib/balancer/pkg/",
+    "@lido/=lib/lido/contracts/",
+    "@pendle/=lib/pendle/contracts/",
+    "@kinet/markets/=contracts/markets/",
+    "base64-sol/=lib/base64/",
+    "hardhat/=lib/forge-std/src/",
+    "forge-std/=lib/forge-std/src/",
+]
+
+ignored_warnings_from = ["lib/safe-smart-account/**", "lib/**"]
+
+# Seaport compilation profile (uses 0.8.24)
+# Build with: FOUNDRY_PROFILE=seaport forge build
+[profile.seaport]
+solc = "0.8.24"
+src = "lib/seaport/contracts"
+out = "out-seaport"
+test = "empty"
+script = "empty"
+libs = ["lib/seaport/lib", "lib"]
+via_ir = false
+optimizer = true
+optimizer_runs = 200
+no_match_path = "**/test/**"
+remappings = [
+    "seaport-core/=lib/seaport/lib/seaport-core/",
+    "seaport-types/=lib/seaport/lib/seaport-types/",
+    "seaport-sol/=lib/seaport/lib/seaport-sol/",
+    "seaport/=lib/seaport/contracts/",
+    "forge-std/=lib/seaport/lib/forge-std/src/",
+    "ds-test/=lib/seaport/lib/ds-test/src/",
+    "@openzeppelin/=lib/seaport/lib/openzeppelin-contracts/",
+    "@rari-capital/solmate/=lib/seaport/lib/solmate/",
+    "solady/=lib/seaport/lib/solady/",
+    "solarray/=lib/seaport/lib/solarray/src/",
+    "murky/=lib/seaport/lib/murky/src/",
+]
+
+# Lint: only run safety lints, suppress naming convention notes
+# Naming follows upstream forks (GMX, Uniswap) for ABI compatibility
+[profile.default.lint]
+severity = ["high", "med"]
+exclude_lints = [
+    "mixed-case-function",
+    "mixed-case-variable",
+    "screaming-snake-case-immutable",
+    "screaming-snake-case-const",
+    "unwrapped-modifier-logic",
+    "named-struct-fields",
+    "pascal-case-struct",
+    "unsafe-cheatcode",
+    "unaliased-plain-import",
+    "erc20-unchecked-transfer",
+    "unsafe-typecast",
+    "divide-before-multiply",
+]

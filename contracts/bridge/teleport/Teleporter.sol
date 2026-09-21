@@ -1,0 +1,529 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2025 kinet labs.
+pragma solidity ^0.8.31;
+
+import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+
+/**
+ * @title Teleporter
+ * @author kinet labs
+ * @notice Simple burn/mint teleporter on Knt for base collateral (ETH, USDC, USDT, DAI, etc.)
+ * @dev Part of the Liquid system for self-repaying bridged asset loans
+ *
+ * Architecture:
+ * - Receives MPC-signed proofs of deposits from LiquidVault on external chains
+ * - Mints bridged tokens (KETH, KUSD, etc.) on Knt
+ * - Receives yield proofs and mints yield tokens to LiquidYield
+ * - Burns tokens for withdrawals back to source chain
+ *
+ * Domain Separation:
+ * - Deposit nonces: used for user deposits (mintDeposit)
+ * - Yield nonces: used for yield minting (mintYield) - separate namespace
+ * - Withdraw nonces: used for burn and release flow
+ *
+ * Invariants:
+ * - totalMinted <= totalBackingOnSourceChain (attested via MPC)
+ * - Only MPC can mint (via signed proofs)
+ * - Burn requires token balance
+ */
+contract Teleporter is AccessControl, ReentrancyGuard {
+    // ═══════════════════════════════════════════════════════════════════════
+    // ROLES
+    // ═══════════════════════════════════════════════════════════════════════
+
+    bytes32 public constant MPC_ROLE = keccak256("MPC_ROLE");
+    bytes32 public constant LIQUID_YIELD_ROLE = keccak256("LIQUID_YIELD_ROLE");
+    bytes32 public constant PEG_ORACLE_ROLE = keccak256("PEG_ORACLE_ROLE");
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TYPES
+    // ═══════════════════════════════════════════════════════════════════════
+
+    struct DepositMint {
+        uint256 depositNonce;
+        address recipient;
+        uint256 amount;
+        uint256 srcChainId;
+        uint256 timestamp;
+    }
+
+    struct YieldMint {
+        uint256 yieldNonce;
+        uint256 amount;
+        uint256 srcChainId;
+        uint256 timestamp;
+    }
+
+    struct BackingAttestation {
+        uint256 totalBacking; // Total ETH on source chain
+        uint256 timestamp;
+        bytes signature;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CONSTANTS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    uint256 public constant BASIS_POINTS = 10_000;
+
+    /// @notice Peg degradation threshold (99.5% = 9950 bps)
+    uint256 public constant PEG_DEGRADE_THRESHOLD = 9950;
+
+    /// @notice Peg pause threshold (98.5% = 9850 bps)
+    uint256 public constant PEG_PAUSE_THRESHOLD = 9850;
+
+    /// @notice Minimum backing staleness window (30 minutes)
+    uint256 public constant MIN_STALENESS_WINDOW = 30 minutes;
+
+    /// @notice Maximum backing staleness window (24 hours)
+    uint256 public constant MAX_STALENESS_WINDOW = 24 hours;
+
+    /// @notice Maximum backing attestation age (1 hour)
+    uint256 public constant MAX_BACKING_AGE = 1 hours;
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // STATE
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// @notice The bridged token (KETH, KUSD, etc.)
+    IBridgedToken public immutable token;
+
+    /// @notice LiquidETH vault for debt notifications (if applicable)
+    address public liquidVault;
+
+    /// @notice LiquidYield for yield routing
+    address public liquidYield;
+
+    /// @notice Total KETH minted via deposits
+    uint256 public totalDepositMinted;
+
+    /// @notice Total KETH minted via yield
+    uint256 public totalYieldMinted;
+
+    /// @notice Total KETH burned for withdrawals
+    uint256 public totalBurned;
+
+    /// @notice Processed deposit nonces (replay protection)
+    mapping(uint256 => mapping(uint256 => bool)) public processedDeposits; // srcChainId => depositNonce => processed
+
+    /// @notice Processed yield nonces (replay protection)
+    mapping(uint256 => mapping(uint256 => bool)) public processedYields; // srcChainId => yieldNonce => processed
+
+    /// @notice Pending withdraw nonces
+    mapping(uint256 => bool) public pendingWithdraws;
+
+    /// @notice Latest backing attestation per source chain
+    mapping(uint256 => BackingAttestation) public backingAttestations;
+
+    /// @notice MPC Oracle addresses
+    mapping(address => bool) public mpcOracles;
+
+    /// @notice Sequential withdraw counter (HIGH-01: replaces hash-based nonce)
+    uint256 public withdrawCounter;
+
+    /// @notice Configurable backing staleness window (HIGH-02: default 2 hours, was 24)
+    uint256 public backingStalenessWindow = 2 hours;
+
+    /// @notice Current peg in basis points (HIGH-05: oracle-settable, default 10000 = 1:1)
+    uint256 public currentPegBps = BASIS_POINTS;
+
+    /// @notice Paused state
+    bool public paused;
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // EVENTS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// @notice Emitted when KETH minted for deposit
+    event DepositMinted(
+        uint256 indexed srcChainId, uint256 indexed depositNonce, address indexed recipient, uint256 amount
+    );
+
+    /// @notice Emitted when KETH minted for yield
+    event YieldMinted(uint256 indexed srcChainId, uint256 indexed yieldNonce, uint256 amount);
+
+    /// @notice Emitted when KETH burned for withdrawal
+    event BurnedForWithdraw(address indexed user, uint256 amount, uint256 indexed withdrawNonce);
+
+    /// @notice Emitted when backing attestation updated
+    event BackingUpdated(uint256 indexed srcChainId, uint256 totalBacking, uint256 timestamp);
+
+    /// @notice Emitted when MPC oracle updated
+    event MPCOracleSet(address indexed oracle, bool active);
+
+    /// @notice Emitted when paused state changes
+    event PausedStateChanged(bool paused);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ERRORS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    error ZeroAmount();
+    error ZeroAddress();
+    error Unauthorized();
+    error InvalidSignature();
+    error NonceAlreadyProcessed();
+    error InsufficientBalance();
+    error BridgePaused();
+    error PegDegraded();
+    error BackingInsufficient();
+    error StaleAttestation();
+    error TimestampTooOld();
+    error TimestampInFuture();
+    error InvalidStalenessWindow();
+    error InvalidPegValue();
+    error StaleTimestamp();
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // MODIFIERS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    modifier whenNotPaused() {
+        if (paused) revert BridgePaused();
+        _;
+    }
+
+    modifier checkPeg() {
+        uint256 peg = getCurrentPeg();
+        if (peg < PEG_PAUSE_THRESHOLD) revert BridgePaused();
+        _;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CONSTRUCTOR
+    // ═══════════════════════════════════════════════════════════════════════
+
+    constructor(address _leth, address _mpcOracle) {
+        if (_leth == address(0) || _mpcOracle == address(0)) revert ZeroAddress();
+
+        token = IBridgedToken(_leth);
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MPC_ROLE, _mpcOracle);
+        mpcOracles[_mpcOracle] = true;
+
+        emit MPCOracleSet(_mpcOracle, true);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // MINT FUNCTIONS (MPC ONLY)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Mint KETH for a deposit proof from source chain
+     * @param srcChainId Source chain ID (e.g., Base = 8453)
+     * @param depositNonce Deposit nonce from TeleportVault
+     * @param recipient KETH recipient on Knt
+     * @param amount Amount of KETH to mint
+     * @param signature MPC signature of deposit proof
+     */
+    function mintDeposit(
+        uint256 srcChainId,
+        uint256 depositNonce,
+        address recipient,
+        uint256 amount,
+        bytes calldata signature
+    ) external nonReentrant whenNotPaused checkPeg {
+        if (amount == 0) revert ZeroAmount();
+        if (recipient == address(0)) revert ZeroAddress();
+        if (processedDeposits[srcChainId][depositNonce]) revert NonceAlreadyProcessed();
+
+        // NEW-01: bytes32 tag for deterministic fixed-size encoding (trivial to match in Go)
+        bytes32 messageHash = keccak256(abi.encode(bytes32("DEPOSIT"), srcChainId, depositNonce, recipient, amount));
+        bytes32 ethSignedHash = MessageHashUtils.toEthSignedMessageHash(messageHash);
+        address signer = ECDSA.recover(ethSignedHash, signature);
+
+        if (!mpcOracles[signer]) revert InvalidSignature();
+
+        // Check backing ratio
+        _checkBackingRatio(srcChainId, amount);
+
+        // Mark as processed
+        processedDeposits[srcChainId][depositNonce] = true;
+        totalDepositMinted += amount;
+
+        // Mint tokens to recipient
+        token.mint(recipient, amount);
+
+        emit DepositMinted(srcChainId, depositNonce, recipient, amount);
+    }
+
+    /**
+     * @notice Mint KETH for yield harvested on source chain
+     * @param srcChainId Source chain ID
+     * @param yieldNonce Yield nonce from TeleportVault
+     * @param amount Amount of yield KETH to mint
+     * @param signature MPC signature of yield proof
+     */
+    function mintYield(uint256 srcChainId, uint256 yieldNonce, uint256 amount, bytes calldata signature)
+        external
+        nonReentrant
+        whenNotPaused
+    {
+        if (amount == 0) revert ZeroAmount();
+        if (liquidYield == address(0)) revert ZeroAddress();
+        if (processedYields[srcChainId][yieldNonce]) revert NonceAlreadyProcessed();
+
+        // NEW-01: bytes32 tag for deterministic fixed-size encoding
+        bytes32 messageHash = keccak256(abi.encode(bytes32("YIELD"), srcChainId, yieldNonce, amount));
+        bytes32 ethSignedHash = MessageHashUtils.toEthSignedMessageHash(messageHash);
+        address signer = ECDSA.recover(ethSignedHash, signature);
+
+        if (!mpcOracles[signer]) revert InvalidSignature();
+
+        // Mark as processed
+        processedYields[srcChainId][yieldNonce] = true;
+        totalYieldMinted += amount;
+
+        // Mint yield tokens directly to LiquidYield
+        token.mint(liquidYield, amount);
+
+        // Notify LiquidYield
+        ILiquidYield(liquidYield).onYieldReceived(amount, srcChainId);
+
+        emit YieldMinted(srcChainId, yieldNonce, amount);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // BURN FUNCTIONS (USER)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Burn KETH to initiate withdrawal back to source chain
+     * @param amount Amount of KETH to burn
+     * @param srcChainId Destination chain for ETH release
+     * @param recipient ETH recipient on source chain
+     * @return withdrawNonce Unique withdraw nonce for tracking
+     */
+    function burnForWithdraw(uint256 amount, uint256 srcChainId, address recipient)
+        external
+        nonReentrant
+        whenNotPaused
+        returns (uint256 withdrawNonce)
+    {
+        if (amount == 0) revert ZeroAmount();
+        if (recipient == address(0)) revert ZeroAddress();
+
+        // Burn tokens from user
+        token.burnFrom(msg.sender, amount);
+
+        // HIGH-01: Sequential counter — no collisions, no lost burns
+        withdrawNonce = ++withdrawCounter;
+
+        pendingWithdraws[withdrawNonce] = true;
+        totalBurned += amount;
+
+        emit BurnedForWithdraw(msg.sender, amount, withdrawNonce);
+
+        // MPC will monitor this event and call release on LiquidVault
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // BACKING ATTESTATION (MPC ONLY)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Update backing attestation for a source chain
+     * @param srcChainId Source chain ID
+     * @param totalBacking Total ETH backing on source chain
+     * @param timestamp MPC-signed timestamp (must be recent)
+     * @param signature MPC signature over (srcChainId, totalBacking, timestamp)
+     */
+    function updateBacking(uint256 srcChainId, uint256 totalBacking, uint256 timestamp, bytes calldata signature)
+        external
+    {
+        // Future check first to prevent underflow in age check
+        if (timestamp > block.timestamp) revert TimestampInFuture();
+        if (block.timestamp - timestamp > MAX_BACKING_AGE) revert TimestampTooOld();
+
+        // NEW-07: Monotonicity — prevent replaying older attestations
+        if (timestamp <= backingAttestations[srcChainId].timestamp) revert StaleTimestamp();
+
+        // NEW-01: bytes32 tag for deterministic fixed-size encoding
+        bytes32 messageHash = keccak256(abi.encode(bytes32("BACKING"), srcChainId, totalBacking, timestamp));
+        bytes32 ethSignedHash = MessageHashUtils.toEthSignedMessageHash(messageHash);
+        address signer = ECDSA.recover(ethSignedHash, signature);
+
+        if (!mpcOracles[signer]) revert InvalidSignature();
+
+        backingAttestations[srcChainId] =
+            BackingAttestation({ totalBacking: totalBacking, timestamp: timestamp, signature: signature });
+
+        emit BackingUpdated(srcChainId, totalBacking, timestamp);
+
+        // Auto-pause if backing insufficient
+        if (totalBacking < totalMinted()) {
+            paused = true;
+            emit PausedStateChanged(true);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ADMIN FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Set LiquidVault address (for debt notifications)
+     * @param _liquidVault LiquidVault address
+     */
+    function setLiquidVault(address _liquidVault) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_liquidVault == address(0)) revert ZeroAddress();
+        liquidVault = _liquidVault;
+    }
+
+    /**
+     * @notice Set LiquidYield address
+     * @param _liquidYield LiquidYield address
+     */
+    function setLiquidYield(address _liquidYield) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_liquidYield == address(0)) revert ZeroAddress();
+        liquidYield = _liquidYield;
+        _grantRole(LIQUID_YIELD_ROLE, _liquidYield);
+    }
+
+    /**
+     * @notice Set MPC oracle status
+     * @param oracle Oracle address
+     * @param active Active status
+     */
+    function setMPCOracle(address oracle, bool active) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (oracle == address(0)) revert ZeroAddress();
+
+        mpcOracles[oracle] = active;
+
+        if (active) {
+            _grantRole(MPC_ROLE, oracle);
+        } else {
+            _revokeRole(MPC_ROLE, oracle);
+        }
+
+        emit MPCOracleSet(oracle, active);
+    }
+
+    /**
+     * @notice Set paused state
+     * @param _paused New paused state
+     */
+    function setPaused(bool _paused) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        paused = _paused;
+        emit PausedStateChanged(_paused);
+    }
+
+    /**
+     * @notice HIGH-02: Set backing staleness window
+     * @param window New staleness window in seconds (min 30m, max 24h)
+     */
+    function setBackingStalenessWindow(uint256 window) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (window < MIN_STALENESS_WINDOW || window > MAX_STALENESS_WINDOW) revert InvalidStalenessWindow();
+        backingStalenessWindow = window;
+    }
+
+    /**
+     * @notice HIGH-05: Set current peg value (admin or oracle)
+     * @param pegBps Peg value in basis points (e.g. 10000 = 1:1)
+     */
+    function setCurrentPeg(uint256 pegBps) external {
+        if (!hasRole(DEFAULT_ADMIN_ROLE, msg.sender) && !hasRole(PEG_ORACLE_ROLE, msg.sender)) {
+            revert Unauthorized();
+        }
+        if (pegBps < PEG_PAUSE_THRESHOLD || pegBps > 2 * BASIS_POINTS) revert InvalidPegValue();
+        currentPegBps = pegBps;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // VIEW FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Get total tokens minted (deposits + yield)
+     */
+    function totalMinted() public view returns (uint256) {
+        return totalDepositMinted + totalYieldMinted;
+    }
+
+    /**
+     * @notice Get net KETH in circulation
+     */
+    function netCirculation() external view returns (uint256) {
+        uint256 minted = totalMinted();
+        if (totalBurned > minted) return 0;
+        return minted - totalBurned;
+    }
+
+    /**
+     * @notice Get current peg ratio (in basis points)
+     * @dev 10000 = 1:1, 9950 = 99.5%. Updated by PEG_ORACLE_ROLE or admin.
+     */
+    function getCurrentPeg() public view returns (uint256) {
+        return currentPegBps;
+    }
+
+    /**
+     * @notice Check if deposit nonce is processed
+     */
+    function isDepositProcessed(uint256 srcChainId, uint256 depositNonce) external view returns (bool) {
+        return processedDeposits[srcChainId][depositNonce];
+    }
+
+    /**
+     * @notice Check if yield nonce is processed
+     */
+    function isYieldProcessed(uint256 srcChainId, uint256 yieldNonce) external view returns (bool) {
+        return processedYields[srcChainId][yieldNonce];
+    }
+
+    /**
+     * @notice Get backing attestation for a source chain
+     */
+    function getBacking(uint256 srcChainId) external view returns (uint256 totalBacking, uint256 timestamp) {
+        BackingAttestation memory attestation = backingAttestations[srcChainId];
+        return (attestation.totalBacking, attestation.timestamp);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // INTERNAL FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Check that backing ratio is sufficient for new minting
+     * @dev C-02 fix: Revert on stale attestation instead of silently allowing
+     */
+    function _checkBackingRatio(uint256 srcChainId, uint256 additionalMint) internal view {
+        BackingAttestation memory attestation = backingAttestations[srcChainId];
+
+        // HIGH-02: Configurable staleness window (default 2h, was 24h)
+        if (block.timestamp - attestation.timestamp > backingStalenessWindow) {
+            revert StaleAttestation();
+        }
+
+        uint256 newTotalMinted = totalMinted() + additionalMint;
+
+        if (newTotalMinted > attestation.totalBacking) {
+            revert BackingInsufficient();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INTERFACES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * @notice Interface for bridged tokens (KETH, KUSD, etc.)
+ */
+interface IBridgedToken {
+    function mint(address to, uint256 amount) external;
+    function burn(uint256 amount) external;
+    function burnFrom(address from, uint256 amount) external;
+    function balanceOf(address account) external view returns (uint256);
+}
+
+/**
+ * @notice Interface for LiquidYield
+ */
+interface ILiquidYield {
+    function onYieldReceived(uint256 amount, uint256 srcChainId) external;
+}
